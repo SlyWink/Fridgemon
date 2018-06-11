@@ -1,8 +1,4 @@
-#ifdef DEBUG
 #define F_CPU 1000000L
-#include "dbginclude.c"
-#include <util/delay.h>
-#endif
 
 #include <avr/interrupt.h>
 #include <avr/wdt.h>
@@ -19,7 +15,8 @@
 #define TOO_HOT_OFFSET 2
 #define TOO_HOT_COUNT  2 // 2 * 5mn = 10mn
 
-#define ADC_SAMPLES 32
+#define ADC_SAMPLES_COUNT  24
+#define ADC_SAMPLES_REJECT 8
 
 #define LOW_BATTERY 402 // = 1.1v / 2.8v * 1024
 
@@ -27,6 +24,7 @@
 #define BATTERY_MASK      (_BV(MUX3) | _BV(MUX2) )
 
 #define Modify_Watchdog() WDTCR |= _BV(WDCE) | _BV(WDE)
+
 
 EMPTY_INTERRUPT(WDT_vect) ;
 
@@ -49,7 +47,7 @@ void Delay_Sleep(void) {
   sleep_mode() ;
   cli() ;
   Modify_Watchdog() ;
-  WDTCR &= ~(_BV(WDCE) |_BV(WDE)) ;
+  WDTCR &= ~(_BV(WDCE) |_BV(WDE) | _BV(WDIE)) ;
 }
 
 
@@ -60,34 +58,53 @@ void Beep_Sleep(void) {
 }
 
 
-uint16_t Read_ADC_Mux(uint8_t p_mask) {
-  uint16_t l_adcsum ;
+void Sort_Samples(uint16_t *p_val) {
   uint8_t l_count ;
+  uint16_t l_tmp ;
+
+  do {
+    l_tmp = 0xFFFF ;
+    for (l_count=0 ; l_count<ADC_SAMPLES_COUNT-1 ; l_count++)
+      if (p_val[l_count] > p_val[l_count+1]) {
+        l_tmp = p_val[l_count] ;
+        p_val[l_count] = p_val[l_count+1] ;
+        p_val[l_count+1] = l_tmp ;
+      }
+  } while (l_tmp < 0xFFFF) ; // ADC value is only 0x3FF max
+}
+
+
+uint16_t Read_ADC_Mux(uint8_t p_mask) {
+  static uint16_t l_samples[ADC_SAMPLES_COUNT] ;
+  static uint16_t l_adcval ;
+  static int8_t l_count ;
 
   set_sleep_mode(SLEEP_MODE_ADC) ;
   ADMUX = p_mask ;
   ADCSRA |= _BV(ADEN) | _BV(ADIE) ; // ADC enable, interrupt
   sei() ;
-  for (l_count = 0 ; l_count <= ADC_SAMPLES ; l_count++) {
+  for (l_count = -1 ; l_count < ADC_SAMPLES_COUNT ; l_count++) {
     ADCSRA |= _BV(ADSC) ; // Start new conversion
     sleep_mode() ; // Sleep until ADC interrupt
-    if (l_count)
-      l_adcsum += ADCL | (ADCH << 8) ; // Drop first results, sum next
-    else {
-      l_adcsum = ADCH ; // Drop first result
-      l_adcsum = 0 ;
-    }
+    l_adcval = ADCL | (ADCH << 8) ;
+    if (l_count >= 0) l_samples[l_count] = l_adcval ; // Drops first sample
   }
   cli() ;
   ADCSRA &= ~(_BV(ADEN) | _BV(ADIE)) ; // ADC disable, no interrupt
-  return l_adcsum / ADC_SAMPLES ; // Average result
+
+  Sort_Samples(l_samples) ;
+  l_adcval = 0 ;
+  // Reject min and max values and average the remaining
+  for (l_count = ADC_SAMPLES_REJECT/2 ; l_count < ADC_SAMPLES_COUNT-ADC_SAMPLES_REJECT/2 ; l_count++)
+    l_adcval += l_samples[l_count] ;
+  return l_adcval / (ADC_SAMPLES_COUNT-ADC_SAMPLES_REJECT) ; // Average result
 }
 
 
 int main(void) {
   uint8_t l_elapsed = 0 ;
   uint8_t l_hotcount = 0 ;
-  uint16_t l_lowtemp = 0xFFFF ;
+  uint16_t l_lowtemp = 0xFF00 ; // Not 0xFFFF to keep some place for first comparison
   uint16_t l_curtemp ;
 
   // IO port init
@@ -101,10 +118,6 @@ int main(void) {
   // Warn device ready
   Set_Delay(WDTO_60MS) ;
   Beep_Sleep() ; Delay_Sleep() ; Beep_Sleep() ;
-
-#ifdef DEBUG
-OSCCAL += 10 ;
-#endif
 
   for(;;) {
 
@@ -130,32 +143,6 @@ OSCCAL += 10 ;
     }
 
     l_elapsed++ ;
-
-#ifdef DEBUG
-    Serial_Debug_Init() ;
-
-    l_curtemp = Read_ADC_Mux(TEMPERATURE_MASK) ;
-cli() ;
-    Serial_Debug_Send(0xF1) ;
-    _delay_ms(500) ;
-    l_hotcount = (uint8_t) (l_curtemp >>8) ;
-    Serial_Debug_Send(l_hotcount) ;
-    _delay_ms(1000) ;
-    l_hotcount = (uint8_t) (l_curtemp & 0xFF) ;
-    Serial_Debug_Send(l_hotcount) ;
-    _delay_ms(1000) ;
-
-    l_curtemp = Read_ADC_Mux(BATTERY_MASK) ;
-cli() ;
-    Serial_Debug_Send(0xF2) ;
-    _delay_ms(500) ;
-    l_hotcount = (uint8_t) (l_curtemp >>8) ;
-    Serial_Debug_Send(l_hotcount) ;
-    _delay_ms(1000) ;
-    l_hotcount = (uint8_t) (l_curtemp & 0xFF) ;
-    Serial_Debug_Send(l_hotcount) ;
-    _delay_ms(2000) ;
-#endif
 
   }
 }
