@@ -14,6 +14,8 @@
 #define TOO_HOT_OFFSET 4 // Max degrees over best sampled temperature
 #define TOO_HOT_COUNT  2 // 2 * 5mn = 10mn
 
+#define MAX_TEMPERATURE_COUNT 0x3F // Too keep temperature sum in 16 bits range
+
 #define ADC_SAMPLES_COUNT  24
 #define ADC_SAMPLES_REJECT 8
 
@@ -21,13 +23,6 @@
 
 #define TEMPERATURE_MASK  (_BV(MUX3) | _BV(MUX2) | _BV(MUX1) | _BV(MUX0) | _BV(REFS1))
 #define BATTERY_MASK      (_BV(MUX3) | _BV(MUX2) )
-
-#define TEMPERATURE_VALUES_COUNT 8
-typedef struct {
-  uint16_t value ;
-  uint8_t count ;
-} T_TEMPERATURE ;
-
 
 #define Modify_Watchdog() WDTCR |= _BV(WDCE) | _BV(WDE)
 
@@ -114,41 +109,18 @@ uint16_t Read_ADC_Mux(uint8_t p_mask) {
 }
 
 
-uint16_t Best_Temperature(uint16_t p_temp) {
-  static T_TEMPERATURE l_temps[TEMPERATURE_VALUES_COUNT] ;
-  static uint8_t l_init = TRUE ;
-  static uint16_t l_best = 0 ;
-  T_TEMPERATURE *l_ptemp ;
-  T_TEMPERATURE l_temp ;
-  uint8_t l_index ;
+uint16_t Average_Temperature(uint16_t p_temp) {
+  static uint16_t l_final = 0 ;
+  static uint16_t l_tempsum = 0 ;
+  static uint8_t l_tempcount = 0 ;
+  uint16_t l_average ;
 
-  if (l_best) return l_best ; // Best already found
-  if (l_init) { // First call, initialise temperature array
-    for (l_index=0 ; l_index<TEMPERATURE_VALUES_COUNT ; l_index++) {
-      l_temps[l_index].value = 0 ; l_temps[l_index].count = 0 ;
-    }
-    l_init = FALSE ;
-  }
-  for (l_index=0 ; l_index<TEMPERATURE_VALUES_COUNT ; l_index++) {
-    l_ptemp = &(l_temps[l_index]) ;
-    if (!l_ptemp->count) { // Empty cell, store temperature
-      l_ptemp->value = p_temp ; l_ptemp->count = 1 ;
-      break ;
-    }
-    if (l_ptemp->value == p_temp) { // Temperature exists, increment counter
-      if (++(l_ptemp->count) == 0xFF) return l_best = p_temp ;
-      break ;
-    }
-  }
-  l_temp.value = l_temps[0].value ; l_temp.count = l_temps[0].count ;
-  for (l_index=1 ; l_index<TEMPERATURE_VALUES_COUNT ; l_index++) {
-    l_ptemp = &(l_temps[l_index]) ;
-    if (!(l_ptemp->count)) break ; // No more temperatures stored
-    if (l_ptemp->count > l_temp.count) {
-      l_temp.value = l_ptemp->value ; l_temp.count = l_ptemp->count ;
-    }
-  }
-  return l_temp.value ;
+  if (l_final) return l_final ; // Already have a reliable average temperature
+  l_tempsum += p_temp ; l_tempcount++ ;
+  l_average = l_tempsum / l_tempcount ;
+  if ((l_tempsum % l_tempcount) > (l_tempcount + 1) / 2) l_average++ ;
+  if (l_tempcount == MAX_TEMPERATURE_COUNT) l_final = l_average ; // Stop computing average temperature
+  return l_average ;
 }
 
 
@@ -180,7 +152,7 @@ int main(void) {
   uint8_t l_elapsed = 1 ;
   uint16_t l_curtemp ;
   uint8_t l_hotcount = 0 ;
-  uint16_t l_besttemp = 0xFF00 ; // Not 0xFFFF to keep some place for first comparison
+  uint16_t l_avertemp = 0xFF00 ; // Not 0xFFFF to keep some place for first comparison
 
   // IO port init
   DDRB = _BV(BUZZER_PIN) ; // Output pin for buzzer
@@ -203,8 +175,8 @@ int main(void) {
     if (l_elapsed % SENSOR_DELAY == 0) {
       l_curtemp = Read_ADC_Mux(TEMPERATURE_MASK) ;
       if (l_hotcount < TOO_HOT_COUNT)
-        l_besttemp = Best_Temperature(l_curtemp) ;
-      if (l_curtemp >= l_besttemp + TOO_HOT_OFFSET)
+        l_avertemp = Average_Temperature(l_curtemp) ;
+      if (l_curtemp >= l_avertemp + TOO_HOT_OFFSET)
         l_hotcount++ ;
       else
         l_hotcount = 0 ;
