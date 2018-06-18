@@ -3,7 +3,6 @@
 #include <avr/interrupt.h>
 #include <avr/wdt.h>
 #include <avr/sleep.h>
-#include <avr/eeprom.h>
 
 #define BUZZER_PIN PB2
 
@@ -12,7 +11,7 @@
 
 #define SENSOR_DELAY 38 // 38 * 8s ~ 5mn
 
-#define TOO_HOT_OFFSET 2
+#define TOO_HOT_OFFSET 4 // Max degrees over best sampled temperature
 #define TOO_HOT_COUNT  2 // 2 * 5mn = 10mn
 
 #define ADC_SAMPLES_COUNT  24
@@ -23,7 +22,21 @@
 #define TEMPERATURE_MASK  (_BV(MUX3) | _BV(MUX2) | _BV(MUX1) | _BV(MUX0) | _BV(REFS1))
 #define BATTERY_MASK      (_BV(MUX3) | _BV(MUX2) )
 
+#define TEMPERATURE_VALUES_COUNT 8
+typedef struct {
+  uint16_t value ;
+  uint8_t count ;
+} T_TEMPERATURE ;
+
+
 #define Modify_Watchdog() WDTCR |= _BV(WDCE) | _BV(WDE)
+
+#ifdef ANALYSE
+  #include <avr/eeprom.h>
+  #define NBSAMP 200
+  uint8_t EEMEM numsamp ;
+  uint16_t EEMEM tbsamp[NBSAMP] ;
+#endif
 
 
 EMPTY_INTERRUPT(WDT_vect) ;
@@ -101,11 +114,73 @@ uint16_t Read_ADC_Mux(uint8_t p_mask) {
 }
 
 
+uint16_t Best_Temperature(uint16_t p_temp) {
+  static T_TEMPERATURE l_temps[TEMPERATURE_VALUES_COUNT] ;
+  static uint8_t l_init = TRUE ;
+  static uint16_t l_best = 0 ;
+  T_TEMPERATURE *l_ptemp ;
+  T_TEMPERATURE l_temp ;
+  uint8_t l_index ;
+
+  if (l_best) return l_best ; // Best already found
+  if (l_init) { // First call, initialise temperature array
+    for (l_index=0 ; l_index<TEMPERATURE_VALUES_COUNT ; l_index++) {
+      l_temps[l_index].value = 0 ; l_temps[l_index].count = 0 ;
+    }
+    l_init = FALSE ;
+  }
+  for (l_index=0 ; l_index<TEMPERATURE_VALUES_COUNT ; l_index++) {
+    l_ptemp = &(l_temps[l_index]) ;
+    if (!l_ptemp->count) { // Empty cell, store temperature
+      l_ptemp->value = p_temp ; l_ptemp->count = 1 ;
+      break ;
+    }
+    if (l_ptemp->value == p_temp) { // Temperature exists, increment counter
+      if (++(l_ptemp->count) == 0xFF) return l_best = p_temp ;
+      break ;
+    }
+  }
+  l_temp.value = l_temps[0].value ; l_temp.count = l_temps[0].count ;
+  for (l_index=1 ; l_index<TEMPERATURE_VALUES_COUNT ; l_index++) {
+    l_ptemp = &(l_temps[l_index]) ;
+    if (!(l_ptemp->count)) break ; // No more temperatures stored
+    if (l_ptemp->count > l_temp.count) {
+      l_temp.value = l_ptemp->value ; l_temp.count = l_ptemp->count ;
+    }
+  }
+  return l_temp.value ;
+}
+
+
+#ifdef ANALYSE
+void Get_Samples(uint8_t p_elapsed) {
+  uint16_t l_temp ;
+  uint8_t l_nums ;
+
+  // Check temperature every 5mn
+  if (p_elapsed % SENSOR_DELAY == 0) {
+    l_nums = eeprom_read_byte(&numsamp) ; // Read samples count from EEPROM
+    if (l_nums == 0xFF) l_nums = 0 ;
+    if (l_nums < NBSAMP) {
+      l_temp = Read_ADC_Mux(TEMPERATURE_MASK) ;
+      eeprom_write_word(&tbsamp[l_nums],l_temp) ; // Store new sample in EEPROM
+      l_nums++ ;
+      eeprom_update_byte(&numsamp,l_nums) ; // Update samples count in EEPROM
+    } else {
+      Set_Delay(WDTO_500MS) ; Beep_Sleep() ; // No more samples space left, warn that samples are ready
+    }
+  }
+}
+#endif
+
+
+
+
 int main(void) {
-  uint8_t l_elapsed = 0 ;
-  uint8_t l_hotcount = 0 ;
-  uint16_t l_lowtemp = 0xFF00 ; // Not 0xFFFF to keep some place for first comparison
+  uint8_t l_elapsed = 1 ;
   uint16_t l_curtemp ;
+  uint8_t l_hotcount = 0 ;
+  uint16_t l_besttemp = 0xFF00 ; // Not 0xFFFF to keep some place for first comparison
 
   // IO port init
   DDRB = _BV(BUZZER_PIN) ; // Output pin for buzzer
@@ -123,15 +198,16 @@ int main(void) {
 
     Set_Delay(WDTO_8S) ; Delay_Sleep() ;
 
+
     // Check temperature and battery every 5mn
     if (l_elapsed % SENSOR_DELAY == 0) {
       l_curtemp = Read_ADC_Mux(TEMPERATURE_MASK) ;
-      if (l_curtemp >= l_lowtemp + TOO_HOT_OFFSET)
+      if (l_hotcount < TOO_HOT_COUNT)
+        l_besttemp = Best_Temperature(l_curtemp) ;
+      if (l_curtemp >= l_besttemp + TOO_HOT_OFFSET)
         l_hotcount++ ;
-      else {
-        if (l_curtemp < l_lowtemp) l_lowtemp = l_curtemp ;
+      else
         l_hotcount = 0 ;
-      }
       if (Read_ADC_Mux(BATTERY_MASK) >= LOW_BATTERY) { // Battery level too low
         Set_Delay(WDTO_250MS) ; Beep_Sleep() ;
       }
