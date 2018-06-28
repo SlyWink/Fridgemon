@@ -3,16 +3,20 @@
 #include <avr/interrupt.h>
 #include <avr/wdt.h>
 #include <avr/sleep.h>
+#include <avr/power.h>
 
-#define BUZZER_PIN PB2
+//#define BUZZER_PIN PB2
+#define BUZZER_PIN       PB0
+#define POT_ACTIVATE_PIN PB2
 
 #define FALSE 0
 #define TRUE  1
 
 #define SENSOR_DELAY 38 // 38 * 8s ~ 5mn
 
-#define TOO_HOT_OFFSET 4 // Max degrees over best sampled temperature
+#define TOO_HOT_OFFSET 2 // Max degrees over average temperature (+ potentiometer value)
 #define TOO_HOT_COUNT  2 // 2 * 5mn = 10mn
+#define TOO_HOT_BEEPS 3
 
 #define MAX_TEMPERATURE_COUNT 0x3F // Too keep temperature sum in 16 bits range
 
@@ -21,8 +25,9 @@
 
 #define LOW_BATTERY 402 // = 1.1v / 2.8v * 1024
 
-#define TEMPERATURE_MASK  (_BV(MUX3) | _BV(MUX2) | _BV(MUX1) | _BV(MUX0) | _BV(REFS1))
-#define BATTERY_MASK      (_BV(MUX3) | _BV(MUX2) )
+#define TEMPERATURE_MASK   (_BV(MUX3) | _BV(MUX2) | _BV(MUX1) | _BV(MUX0) | _BV(REFS1))
+#define BATTERY_MASK       (_BV(MUX3) | _BV(MUX2) )
+#define POTENTIOMETER_MASK (_BV(MUX1) | _BV(MUX0) ) // ADC3
 
 #define Modify_Watchdog() WDTCR |= _BV(WDCE) | _BV(WDE)
 
@@ -51,6 +56,7 @@ void Set_Delay(uint8_t p_wdp) {
 void Delay_Sleep(void) {
   set_sleep_mode(SLEEP_MODE_PWR_DOWN) ;
   WDTCR |= _BV(WDIE) | _BV(WDE) ;
+  // VOIR BITS A POSITIONNER DANS MCUCR
   sei() ;
   sleep_mode() ;
   cli() ;
@@ -87,6 +93,7 @@ uint16_t Read_ADC_Mux(uint8_t p_mask) {
   static uint16_t l_adcval ;
   static int8_t l_count ;
 
+  power_adc_enable() ;
   set_sleep_mode(SLEEP_MODE_ADC) ;
   ADMUX = p_mask ;
   ADCSRA |= _BV(ADEN) | _BV(ADIE) ; // ADC enable, interrupt
@@ -99,6 +106,7 @@ uint16_t Read_ADC_Mux(uint8_t p_mask) {
   }
   cli() ;
   ADCSRA &= ~(_BV(ADEN) | _BV(ADIE)) ; // ADC disable, no interrupt
+  power_adc_disable() ;
 
   Sort_Samples(l_samples) ;
   l_adcval = 0 ;
@@ -124,6 +132,16 @@ uint16_t Average_Temperature(uint16_t p_temp) {
 }
 
 
+uint8_t Read_Hot_Offset(void) {
+  uint8_t l_offset ;
+
+  PORTB &= ~_BV(POT_ACTIVATE_PIN) ; // Activate potentiometer
+  l_offset = TOO_HOT_OFFSET + (uint8_t) (Read_ADC_Mux(POTENTIOMETER_MASK) >> 8) ;
+  PORTB |= _BV(POT_ACTIVATE_PIN) ; // Deactivate potentiometer
+  return l_offset ;
+}
+
+
 #ifdef ANALYSE
 void Get_Samples(uint8_t p_elapsed) {
   uint16_t l_temp ;
@@ -146,19 +164,21 @@ void Get_Samples(uint8_t p_elapsed) {
 #endif
 
 
-
-
 int main(void) {
   uint8_t l_elapsed = 1 ;
   uint16_t l_curtemp ;
   uint8_t l_hotcount = 0 ;
   uint16_t l_avertemp = 0xFF00 ; // Not 0xFFFF to keep some place for first comparison
+  uint8_t l_count ;
+
 
   // IO port init
-  DDRB = _BV(BUZZER_PIN) ; // Output pin for buzzer
-  PORTB = ~_BV(BUZZER_PIN) ; // All other pins as input with pull-up
+  DDRB = _BV(BUZZER_PIN) | _BV(POT_ACTIVATE_PIN) ; // Output pins
+  PORTB = ~(_BV(BUZZER_PIN)) ; // All other pins as input with pull-up, pot activate pin high
   // ADC init
   ADCSRA = _BV(ADPS1) | _BV(ADPS0) ; // Prescaler 8
+
+  power_all_disable() ;
 
   Set_Delay(WDTO_500MS) ; Delay_Sleep() ;
 
@@ -166,17 +186,17 @@ int main(void) {
   Set_Delay(WDTO_60MS) ;
   Beep_Sleep() ; Delay_Sleep() ; Beep_Sleep() ;
 
+
   for(;;) {
 
     Set_Delay(WDTO_8S) ; Delay_Sleep() ;
-
 
     // Check temperature and battery every 5mn
     if (l_elapsed % SENSOR_DELAY == 0) {
       l_curtemp = Read_ADC_Mux(TEMPERATURE_MASK) ;
       if (l_hotcount < TOO_HOT_COUNT)
         l_avertemp = Average_Temperature(l_curtemp) ;
-      if (l_curtemp >= l_avertemp + TOO_HOT_OFFSET)
+      if (l_curtemp >= l_avertemp + Read_Hot_Offset())
         l_hotcount++ ;
       else
         l_hotcount = 0 ;
@@ -185,8 +205,13 @@ int main(void) {
       }
     }
 
-    if (l_hotcount >= TOO_HOT_COUNT) { // Too hot for too long
-      Set_Delay(WDTO_1S) ; Beep_Sleep() ;
+    if (l_hotcount >= TOO_HOT_COUNT) { // Too hot for too long -> beep
+      for (l_count=1 ; l_count<=TOO_HOT_BEEPS ; l_count++) {
+        Set_Delay(WDTO_250MS) ; Beep_Sleep() ;
+        if (l_count < TOO_HOT_BEEPS) {
+          Set_Delay(WDTO_120MS) ; Delay_Sleep() ;
+        }
+      }
       l_hotcount = TOO_HOT_COUNT ;
     }
 
