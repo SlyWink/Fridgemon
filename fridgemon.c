@@ -5,7 +5,6 @@
 #include <avr/sleep.h>
 #include <avr/power.h>
 
-//#define BUZZER_PIN PB2
 #define BUZZER_PIN       PB0
 #define POT_ACTIVATE_PIN PB2
 
@@ -46,22 +45,18 @@ EMPTY_INTERRUPT(ADC_vect) ;
 
 void Set_Delay(uint8_t p_wdp) {
   if (p_wdp & 8) p_wdp = _BV(WDP3) | (p_wdp & 7) ;
-  Modify_Watchdog() ;
-  WDTCR &= ~(_BV(WDP3) | _BV(WDP2) | _BV(WDP1) | _BV(WDP0)) ;
-  Modify_Watchdog() ;
-  WDTCR |= p_wdp ;
+  Modify_Watchdog() ; WDTCR &= ~(_BV(WDP3) | _BV(WDP2) | _BV(WDP1) | _BV(WDP0)) ;
+  Modify_Watchdog() ; WDTCR |= p_wdp ;
 }
 
 
 void Delay_Sleep(void) {
   set_sleep_mode(SLEEP_MODE_PWR_DOWN) ;
   WDTCR |= _BV(WDIE) | _BV(WDE) ;
-  // VOIR BITS A POSITIONNER DANS MCUCR
   sei() ;
   sleep_mode() ;
   cli() ;
-  Modify_Watchdog() ;
-  WDTCR &= ~(_BV(WDCE) |_BV(WDE) | _BV(WDIE)) ;
+  Modify_Watchdog() ; WDTCR &= ~(_BV(WDCE) |_BV(WDE) | _BV(WDIE)) ;
 }
 
 
@@ -142,6 +137,22 @@ uint8_t Read_Hot_Offset(void) {
 }
 
 
+void Beep_Repeat(uint8_t p_repeat, uint8_t p_wdpon, uint8_t p_wdpoff) {
+  uint8_t l_count ;
+
+  for (l_count=p_repeat ; ; l_count--) {
+    Set_Delay(p_wdpon) ; Beep_Sleep() ;
+    if (l_count == 1) break ;
+    Set_Delay(p_wdpoff) ; Delay_Sleep() ;
+  }
+}
+
+
+#define Beep_Too_Hot() Beep_Repeat(TOO_HOT_BEEPS,WDTO_250MS,WDTO_120MS)
+
+#define Beep_Offset(p_offset) Beep_Repeat(p_offset,WDTO_120MS,WDTO_120MS)
+
+
 #ifdef ANALYSE
 void Get_Samples(uint8_t p_elapsed) {
   uint16_t l_temp ;
@@ -169,7 +180,8 @@ int main(void) {
   uint16_t l_curtemp ;
   uint8_t l_hotcount = 0 ;
   uint16_t l_avertemp = 0xFF00 ; // Not 0xFFFF to keep some place for first comparison
-  uint8_t l_count ;
+  uint8_t l_prevoffset = 0 ;
+  uint8_t l_curoffset ;
 
 
   // IO port init
@@ -196,7 +208,13 @@ int main(void) {
       l_curtemp = Read_ADC_Mux(TEMPERATURE_MASK) ;
       if (l_hotcount < TOO_HOT_COUNT)
         l_avertemp = Average_Temperature(l_curtemp) ;
-      if (l_curtemp >= l_avertemp + Read_Hot_Offset())
+      l_curoffset = Read_Hot_Offset() ;
+      if (l_curoffset != l_prevoffset) { // Offset modified, beep new value
+        Beep_Offset(l_curoffset) ;
+        l_prevoffset = l_curoffset ;
+        Set_Delay(WDTO_1S) ; Beep_Sleep() ;
+      }
+      if (l_curtemp >= l_avertemp + l_curoffset)
         l_hotcount++ ;
       else
         l_hotcount = 0 ;
@@ -206,12 +224,7 @@ int main(void) {
     }
 
     if (l_hotcount >= TOO_HOT_COUNT) { // Too hot for too long -> beep
-      for (l_count=1 ; l_count<=TOO_HOT_BEEPS ; l_count++) {
-        Set_Delay(WDTO_250MS) ; Beep_Sleep() ;
-        if (l_count < TOO_HOT_BEEPS) {
-          Set_Delay(WDTO_120MS) ; Delay_Sleep() ;
-        }
-      }
+      Beep_Too_Hot() ;
       l_hotcount = TOO_HOT_COUNT ;
     }
 
