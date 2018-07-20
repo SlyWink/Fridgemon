@@ -5,17 +5,20 @@
 #include <avr/sleep.h>
 #include <avr/power.h>
 
-#define BUZZER_PIN       PB0
-#define POT_ACTIVATE_PIN PB2
+#define BUZZER_PIN PB0
+#define BUTTON_PIN PB3
 
+#define BOOLEAN uint8_t
 #define FALSE 0
 #define TRUE  1
 
 #define SENSOR_DELAY 38 // 38 * 8s ~ 5mn
 
-#define TOO_HOT_OFFSET 2 // Max degrees over average temperature (+ potentiometer value)
-#define TOO_HOT_COUNT  2 // 2 * 5mn = 10mn
-#define TOO_HOT_BEEPS 3
+#define TOO_HOT_DELAY      4 // 4 * 8s ~ 30s
+#define TOO_HOT_COUNT      2 // 2 * 5mn = 10mn
+#define TOO_HOT_BEEPS      3
+#define TOO_HOT_MIN_OFFSET 2 // Max degrees over average temperature
+#define TOO_HOT_MAX_OFFSET (TOO_HOT_MIN_OFFSET + 4)
 
 #define MAX_TEMPERATURE_COUNT 0x3F // Too keep temperature sum in 16 bits range
 
@@ -26,21 +29,23 @@
 
 #define TEMPERATURE_MASK   (_BV(MUX3) | _BV(MUX2) | _BV(MUX1) | _BV(MUX0) | _BV(REFS1))
 #define BATTERY_MASK       (_BV(MUX3) | _BV(MUX2) )
-#define POTENTIOMETER_MASK (_BV(MUX1) | _BV(MUX0) ) // ADC3
+
+#define BUTTON_NONE  0
+#define BUTTON_SHORT 1
+#define BUTTON_LONG  2
+#define BUTTON_LONG_DELAY 50 // 50 * 60MS ~ 3s
+
+#define Enable_Button() GIMSK |= _BV(PCIE)
+#define Disable_Button() GIMSK &= ~_BV(PCIE)
+#define Button_Released() (PINB & _BV(BUTTON_PIN))
 
 #define Modify_Watchdog() WDTCR |= _BV(WDCE) | _BV(WDE)
-
-#ifdef ANALYSE
-  #include <avr/eeprom.h>
-  #define NBSAMP 200
-  uint8_t EEMEM numsamp ;
-  uint16_t EEMEM tbsamp[NBSAMP] ;
-#endif
-
 
 EMPTY_INTERRUPT(WDT_vect) ;
 
 EMPTY_INTERRUPT(ADC_vect) ;
+
+EMPTY_INTERRUPT(PCINT0_vect) ;
 
 
 void Set_Delay(uint8_t p_wdp) {
@@ -127,12 +132,11 @@ uint16_t Average_Temperature(uint16_t p_temp) {
 }
 
 
-uint8_t Read_Hot_Offset(void) {
-  uint8_t l_offset ;
+uint8_t Get_Hot_Offset(BOOLEAN p_next) {
+  static uint8_t l_offset = TOO_HOT_MIN_OFFSET;
 
-  PORTB &= ~_BV(POT_ACTIVATE_PIN) ; // Activate potentiometer
-  l_offset = TOO_HOT_OFFSET + (uint8_t) (Read_ADC_Mux(POTENTIOMETER_MASK) >> 8) ;
-  PORTB |= _BV(POT_ACTIVATE_PIN) ; // Deactivate potentiometer
+  if (p_next)
+    if (++l_offset > TOO_HOT_MAX_OFFSET) l_offset = TOO_HOT_MIN_OFFSET ;
   return l_offset ;
 }
 
@@ -152,83 +156,101 @@ void Beep_Repeat(uint8_t p_repeat, uint8_t p_wdpon, uint8_t p_wdpoff) {
 
 #define Beep_Offset(p_offset) Beep_Repeat(p_offset,WDTO_120MS,WDTO_120MS)
 
+#define Beep_Reset() Beep_Repeat(5,WDTO_120MS,WDTO_60MS)
 
-#ifdef ANALYSE
-void Get_Samples(uint8_t p_elapsed) {
-  uint16_t l_temp ;
-  uint8_t l_nums ;
 
-  // Check temperature every 5mn
-  if (p_elapsed % SENSOR_DELAY == 0) {
-    l_nums = eeprom_read_byte(&numsamp) ; // Read samples count from EEPROM
-    if (l_nums == 0xFF) l_nums = 0 ;
-    if (l_nums < NBSAMP) {
-      l_temp = Read_ADC_Mux(TEMPERATURE_MASK) ;
-      eeprom_write_word(&tbsamp[l_nums],l_temp) ; // Store new sample in EEPROM
-      l_nums++ ;
-      eeprom_update_byte(&numsamp,l_nums) ; // Update samples count in EEPROM
-    } else {
-      Set_Delay(WDTO_500MS) ; Beep_Sleep() ; // No more samples space left, warn that samples are ready
+uint8_t Read_Button(void) {
+  uint8_t l_count = 0 ;
+
+  Set_Delay(WDTO_60MS) ;
+  while (!Button_Released()) {
+    Delay_Sleep() ; // First call is also for debouncing
+    if (++l_count >= BUTTON_LONG_DELAY) return BUTTON_LONG ;
+  }
+  return (l_count) ? BUTTON_SHORT : BUTTON_NONE ;
+}
+
+
+void Reset_Avr(void) {
+  Set_Delay(WDTO_15MS) ;
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN) ;
+  WDTCR |= _BV(WDE) ;
+  sleep_mode() ;
+}
+
+
+void Manage_Sensors(void) {
+  static uint8_t l_elapsed = 1 ;
+  static uint16_t l_curtemp ;
+  static uint8_t l_hotcount = 0 ;
+  static uint16_t l_avertemp = 0xFF00 ; // Not 0xFFFF to keep some place for first comparison
+
+  // Check temperature and battery every 5mn
+  if (l_elapsed % SENSOR_DELAY == 0) {
+    l_curtemp = Read_ADC_Mux(TEMPERATURE_MASK) ;
+    if (l_hotcount < TOO_HOT_COUNT)
+      l_avertemp = Average_Temperature(l_curtemp) ;
+    if (l_curtemp >= l_avertemp + Get_Hot_Offset(FALSE))
+      l_hotcount++ ;
+    else
+      l_hotcount = 0 ;
+    if (Read_ADC_Mux(BATTERY_MASK) >= LOW_BATTERY) { // Battery level too low
+      Set_Delay(WDTO_250MS) ; Beep_Sleep() ;
     }
   }
+
+  if ((l_hotcount >= TOO_HOT_COUNT) && (l_elapsed % TOO_HOT_DELAY == 0)) { // Too hot for too long -> beep
+    Beep_Too_Hot() ;
+    l_hotcount = TOO_HOT_COUNT ;
+  }
+
+  l_elapsed++ ;
 }
-#endif
 
 
 int main(void) {
-  uint8_t l_elapsed = 1 ;
-  uint16_t l_curtemp ;
-  uint8_t l_hotcount = 0 ;
-  uint16_t l_avertemp = 0xFF00 ; // Not 0xFFFF to keep some place for first comparison
-  uint8_t l_prevoffset = 0 ;
-  uint8_t l_curoffset ;
 
-
+  // Disable watchdog
+  MCUSR &= ~_BV(WDRF) ;
+  Modify_Watchdog() ; WDTCR &= ~_BV(WDE) ;
   // IO port init
-  DDRB = _BV(BUZZER_PIN) | _BV(POT_ACTIVATE_PIN) ; // Output pins
-  PORTB = ~(_BV(BUZZER_PIN)) ; // All other pins as input with pull-up, pot activate pin high
+  DDRB = _BV(BUZZER_PIN) ; // Output pin
+  PORTB = ~(_BV(BUZZER_PIN)) ; // All other pins as input with pull-up
   // ADC init
   ADCSRA = _BV(ADPS1) | _BV(ADPS0) ; // Prescaler 8
+  // Button pin mask
+  PCMSK = _BV(BUTTON_PIN) ;
 
   power_all_disable() ;
 
   Set_Delay(WDTO_500MS) ; Delay_Sleep() ;
 
   // Warn device ready
-  Set_Delay(WDTO_60MS) ;
-  Beep_Sleep() ; Delay_Sleep() ; Beep_Sleep() ;
-
+  Beep_Offset(Get_Hot_Offset(FALSE)) ;
 
   for(;;) {
 
+    Enable_Button() ;
     Set_Delay(WDTO_8S) ; Delay_Sleep() ;
+    Disable_Button() ;
 
-    // Check temperature and battery every 5mn
-    if (l_elapsed % SENSOR_DELAY == 0) {
-      l_curtemp = Read_ADC_Mux(TEMPERATURE_MASK) ;
-      if (l_hotcount < TOO_HOT_COUNT)
-        l_avertemp = Average_Temperature(l_curtemp) ;
-      l_curoffset = Read_Hot_Offset() ;
-      if (l_curoffset != l_prevoffset) { // Offset modified, beep new value
-        Beep_Offset(l_curoffset) ;
-        l_prevoffset = l_curoffset ;
-        Set_Delay(WDTO_1S) ; Beep_Sleep() ;
-      }
-      if (l_curtemp >= l_avertemp + l_curoffset)
-        l_hotcount++ ;
-      else
-        l_hotcount = 0 ;
-      if (Read_ADC_Mux(BATTERY_MASK) >= LOW_BATTERY) { // Battery level too low
-        Set_Delay(WDTO_250MS) ; Beep_Sleep() ;
-      }
+    switch (Read_Button()) {
+
+      case BUTTON_SHORT:
+        Beep_Offset(Get_Hot_Offset(TRUE)) ;
+        Set_Delay(WDTO_250MS) ; Delay_Sleep() ;
+        break ;
+
+      case BUTTON_LONG:
+        Beep_Reset() ;
+        Set_Delay(WDTO_2S) ; Delay_Sleep() ;
+        Reset_Avr() ;
+        break ;
+
+      default:
+        Manage_Sensors() ;
+        break ;
     }
-
-    if (l_hotcount >= TOO_HOT_COUNT) { // Too hot for too long -> beep
-      Beep_Too_Hot() ;
-      l_hotcount = TOO_HOT_COUNT ;
-    }
-
-    l_elapsed++ ;
 
   }
 }
